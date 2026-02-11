@@ -22,6 +22,7 @@ export default class JSyncPlugin extends Plugin {
     private statusBarItem: HTMLElement | null = null;
     private ribbonIconEl: HTMLElement | null = null;
     private isSyncingFlag = false;
+    private lastVaultChange = 0;
 
     async onload(): Promise<void> {
         console.log("[JSync] Loading plugin...");
@@ -126,6 +127,13 @@ export default class JSyncPlugin extends Plugin {
             }
             this.scheduleAutoSync();
         });
+
+        // ─── Vault change tracking for debounce ─────────────
+        const trackChange = () => { this.lastVaultChange = Date.now(); };
+        this.registerEvent(this.app.vault.on("modify", trackChange));
+        this.registerEvent(this.app.vault.on("create", trackChange));
+        this.registerEvent(this.app.vault.on("delete", trackChange));
+        this.registerEvent(this.app.vault.on("rename", trackChange));
 
         console.log("[JSync] Plugin loaded successfully");
     }
@@ -309,10 +317,10 @@ export default class JSyncPlugin extends Plugin {
 
         if (result.uploaded > 0) parts.push(`↑${result.uploaded}`);
         if (result.downloaded > 0) parts.push(`↓${result.downloaded}`);
+        if (result.renames > 0) parts.push(`↔${result.renames}`);
         if (result.deletedLocal > 0) parts.push(`🗑L${result.deletedLocal}`);
         if (result.deletedRemote > 0) parts.push(`🗑R${result.deletedRemote}`);
         if (result.conflicts > 0) parts.push(`⚠${result.conflicts}`);
-
         const summary =
             parts.length > 0
                 ? parts.join(" | ")
@@ -354,8 +362,16 @@ export default class JSyncPlugin extends Plugin {
 
         if (this.settings.autoSyncEnabled && this.settings.autoSyncInterval > 0) {
             const intervalMs = this.settings.autoSyncInterval * 60 * 1000;
+            const debounceMs = (this.settings.syncDebounceSeconds ?? 10) * 1000;
+
             this.autoSyncTimer = setInterval(async () => {
                 if (!this.isSyncingFlag && this.megaClient.isConnected()) {
+                    // Debounce: skip if vault was changed recently
+                    const elapsed = Date.now() - this.lastVaultChange;
+                    if (this.lastVaultChange > 0 && elapsed < debounceMs) {
+                        console.log(`[JSync] Auto-sync debounced (${Math.round(elapsed / 1000)}s < ${debounceMs / 1000}s)`);
+                        return;
+                    }
                     console.log("[JSync] Auto-sync triggered");
                     await this.triggerSync();
                 }

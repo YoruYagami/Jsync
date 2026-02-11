@@ -31,7 +31,10 @@ export interface SyncStateData {
     deviceId: string;
 }
 
-const SYNC_STATE_PATH = ".jsync/sync-state.json";
+const SYNC_STATE_DIR = ".obsidian/jsync";
+const SYNC_STATE_PATH = `${SYNC_STATE_DIR}/sync-state.json`;
+const LEGACY_DIR = ".jsync";
+const LEGACY_PATH = `${LEGACY_DIR}/sync-state.json`;
 const CURRENT_VERSION = 1;
 
 /**
@@ -57,14 +60,30 @@ export class SyncState {
      */
     async load(): Promise<void> {
         try {
-            const exists = await this.vault.adapter.exists(SYNC_STATE_PATH);
+            let exists = await this.vault.adapter.exists(SYNC_STATE_PATH);
+
+            // Auto-migrate from legacy .jsync/ location
+            if (!exists) {
+                const legacyExists = await this.vault.adapter.exists(LEGACY_PATH);
+                if (legacyExists) {
+                    console.log("[JSync] Migrating sync state from .jsync/ to .obsidian/jsync/");
+                    const raw = await this.vault.adapter.read(LEGACY_PATH);
+                    const dirExists = await this.vault.adapter.exists(SYNC_STATE_DIR);
+                    if (!dirExists) await this.vault.adapter.mkdir(SYNC_STATE_DIR);
+                    await this.vault.adapter.write(SYNC_STATE_PATH, raw);
+                    // Clean up legacy
+                    await this.vault.adapter.remove(LEGACY_PATH);
+                    try { await this.vault.adapter.rmdir(LEGACY_DIR, false); } catch { /* not empty */ }
+                    exists = true;
+                }
+            }
+
             if (exists) {
                 const raw = await this.vault.adapter.read(SYNC_STATE_PATH);
                 const parsed = JSON.parse(raw) as SyncStateData;
                 if (parsed.version === CURRENT_VERSION) {
                     this.data = parsed;
                 } else {
-                    // Migration: reset state for incompatible versions
                     console.log("[JSync] Sync state version mismatch, resetting");
                     this.data.items = {};
                     this.data.lastSyncTime = 0;
@@ -81,9 +100,9 @@ export class SyncState {
      */
     async save(): Promise<void> {
         try {
-            const dirExists = await this.vault.adapter.exists(".jsync");
+            const dirExists = await this.vault.adapter.exists(SYNC_STATE_DIR);
             if (!dirExists) {
-                await this.vault.adapter.mkdir(".jsync");
+                await this.vault.adapter.mkdir(SYNC_STATE_DIR);
             }
             const json = JSON.stringify(this.data, null, 2);
             await this.vault.adapter.write(SYNC_STATE_PATH, json);

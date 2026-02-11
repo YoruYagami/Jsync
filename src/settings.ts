@@ -25,6 +25,8 @@ export interface JSyncSettings {
     maxFileSizeMB: number;
     /** Show notifications for sync events */
     showNotifications: boolean;
+    /** Seconds to wait after last vault change before auto-syncing */
+    syncDebounceSeconds: number;
 }
 
 /**
@@ -41,6 +43,7 @@ export const DEFAULT_SETTINGS: JSyncSettings = {
     excludedFolders: [".obsidian", ".trash"],
     maxFileSizeMB: 50,
     showNotifications: true,
+    syncDebounceSeconds: 10,
 };
 
 /**
@@ -166,6 +169,20 @@ export class JSyncSettingTab extends PluginSettingTab {
             );
 
         new Setting(containerEl)
+            .setName("Sync Debounce (seconds)")
+            .setDesc("Wait this many seconds after last vault change before auto-syncing")
+            .addSlider((slider) =>
+                slider
+                    .setLimits(0, 60, 1)
+                    .setValue(this.plugin.settings.syncDebounceSeconds)
+                    .setDynamicTooltip()
+                    .onChange(async (value) => {
+                        this.plugin.settings.syncDebounceSeconds = value;
+                        await this.plugin.saveSettings();
+                    })
+            );
+
+        new Setting(containerEl)
             .setName("Sync Attachments")
             .setDesc("Synchronize binary files (images, PDFs, etc.)")
             .addToggle((toggle) =>
@@ -217,7 +234,7 @@ export class JSyncSettingTab extends PluginSettingTab {
         new Setting(containerEl)
             .setName("Excluded Folders")
             .setDesc(
-                "Folders to exclude from sync (comma-separated). '.jsync' is always excluded."
+                "Folders to exclude from sync (comma-separated). '.obsidian' and '.trash' are excluded by default."
             )
             .addTextArea((text) =>
                 text

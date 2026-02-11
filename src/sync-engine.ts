@@ -24,6 +24,7 @@ export interface SyncResult {
     deletedLocal: number;
     deletedRemote: number;
     conflicts: number;
+    renames: number;
     errors: string[];
     duration: number;
 }
@@ -113,7 +114,7 @@ export class SyncEngine {
             return {
                 success: false, uploaded: 0, downloaded: 0,
                 deletedLocal: 0, deletedRemote: 0, conflicts: 0,
-                errors: ["Sync already in progress"], duration: 0,
+                renames: 0, errors: ["Sync already in progress"], duration: 0,
             };
         }
 
@@ -124,7 +125,7 @@ export class SyncEngine {
         const result: SyncResult = {
             success: true, uploaded: 0, downloaded: 0,
             deletedLocal: 0, deletedRemote: 0, conflicts: 0,
-            errors: [], duration: 0,
+            renames: 0, errors: [], duration: 0,
         };
 
         let lockAcquired = false;
@@ -179,12 +180,21 @@ export class SyncEngine {
             if (this.cancelRequested) throw new Error("Cancelled");
 
             // ══════════════════════════════════════════════════════════
-            //  Step 2: DELETE_REMOTE
-            //  Delete remote items that have been deleted locally.
-            //  This is exactly Joplin's "delete_remote" step.
+            //  Step 1.5: RENAME DETECTION
+            //  Detect file moves via hash matching to avoid delete+re-upload.
             // ══════════════════════════════════════════════════════════
 
-            this.report("Step 2/3: Deleting remote...", 6, 10);
+            this.report("Detecting renames...", 5, 12);
+            await this.stepRenameDetect(localFiles, result);
+
+            if (this.cancelRequested) throw new Error("Cancelled");
+
+            // ══════════════════════════════════════════════════════════
+            //  Step 2: DELETE_REMOTE
+            //  Delete remote items that have been deleted locally.
+            // ══════════════════════════════════════════════════════════
+
+            this.report("Step 2/3: Deleting remote...", 7, 12);
             await this.stepDeleteRemote(localFiles, result);
 
             if (this.cancelRequested) throw new Error("Cancelled");
@@ -196,18 +206,18 @@ export class SyncEngine {
             //  no conflict is possible (exactly like Joplin's delta step).
             // ══════════════════════════════════════════════════════════
 
-            this.report("Step 3/3: Downloading changes...", 7, 10);
+            this.report("Step 3/3: Downloading changes...", 9, 12);
             this.mega.clearCache();
             const remoteFiles = await this.scanRemoteFiles();
             await this.stepDelta(localFiles, remoteFiles, result);
 
             // ── Save state ──────────────────────────────────────────
-            this.report("Saving state...", 9, 10);
+            this.report("Saving state...", 11, 12);
             await this.saveRemoteHashes();
             this.syncState.setLastSyncTime(Date.now());
             await this.syncState.save();
 
-            this.report("Sync complete!", 10, 10);
+            this.report("Sync complete!", 12, 12);
         } catch (e: any) {
             result.success = false;
             const msg = e?.message || String(e);
@@ -360,21 +370,29 @@ export class SyncEngine {
             if (file.stat.size > this.settings.maxFileSizeMB * 1024 * 1024) continue;
             if (!this.settings.syncAttachments && isBinaryFile(file.path)) continue;
 
+            const normalPath = normalizePath(file.path);
             let hash: string;
-            try {
-                if (isBinaryFile(file.path)) {
-                    const buf = await this.vault.readBinary(file);
-                    hash = computeHash(Buffer.from(buf));
-                } else {
-                    const content = await this.vault.read(file);
-                    hash = computeHash(content);
+
+            // Mtime-first optimization: skip hashing if mtime unchanged
+            const syncItem = this.syncState.getItem(normalPath);
+            if (syncItem && file.stat.mtime === syncItem.localMtime && file.stat.size === syncItem.size) {
+                hash = syncItem.contentHash;
+            } else {
+                try {
+                    if (isBinaryFile(file.path)) {
+                        const buf = await this.vault.readBinary(file);
+                        hash = computeHash(Buffer.from(buf));
+                    } else {
+                        const content = await this.vault.read(file);
+                        hash = computeHash(content);
+                    }
+                } catch (e) {
+                    console.warn(`[JSync] Could not read ${file.path}, skipping:`, e);
+                    continue;
                 }
-            } catch (e) {
-                console.warn(`[JSync] Could not read ${file.path}, skipping:`, e);
-                continue;
             }
 
-            localMap.set(normalizePath(file.path), {
+            localMap.set(normalPath, {
                 mtime: file.stat.mtime,
                 size: file.stat.size,
                 hash,
@@ -487,7 +505,103 @@ export class SyncEngine {
     }
 
     // ────────────────────────────────────────────────────────────
-    //  STEP 2: DELETE_REMOTE (Joplin's "delete_remote" step)
+    //  STEP 1.5: RENAME DETECTION (hash-based move tracking)
+    // ────────────────────────────────────────────────────────────
+
+    /**
+     * Detect file renames/moves by matching content hashes.
+     * If a file disappears from path A and a same-hash file appears at path B,
+     * we upload to B and delete from A instead of re-uploading the full content.
+     */
+    private async stepRenameDetect(
+        localFiles: Map<string, { mtime: number; size: number; hash: string }>,
+        result: SyncResult
+    ): Promise<void> {
+        const syncItems = this.syncState.getAllItems();
+
+        // Build index of "deleted locally" items: in sync state but not in local
+        const deletedLocally = new Map<string, SyncItemState>();
+        for (const [path, item] of Object.entries(syncItems)) {
+            if (!localFiles.has(path)) {
+                deletedLocally.set(path, item);
+            }
+        }
+
+        if (deletedLocally.size === 0) return;
+
+        // Build index of "new locally" items: in local but not in sync state
+        const newLocally = new Map<string, { mtime: number; size: number; hash: string }>();
+        for (const [path, local] of localFiles) {
+            if (!syncItems[path]) {
+                newLocally.set(path, local);
+            }
+        }
+
+        if (newLocally.size === 0) return;
+
+        // Build hash → deleted-path index
+        const hashToDeleted = new Map<string, string>();
+        for (const [path, item] of deletedLocally) {
+            hashToDeleted.set(item.contentHash, path);
+        }
+
+        // Match new files to deleted files by hash
+        for (const [newPath, newLocal] of newLocally) {
+            if (this.cancelRequested) break;
+
+            const oldPath = hashToDeleted.get(newLocal.hash);
+            if (!oldPath) continue;
+
+            // Found a rename: oldPath → newPath (same content hash)
+            try {
+                console.log(`[JSync] Rename detected: ${oldPath} → ${newPath}`);
+
+                // Upload to new remote path
+                const remotePath = `${this.settings.remoteFolder}/${newPath}`;
+                const oldRemotePath = `${this.settings.remoteFolder}/${oldPath}`;
+
+                // Read content and upload to new location
+                const file = this.vault.getAbstractFileByPath(newPath);
+                if (!file || !(file instanceof TFile)) continue;
+
+                let content: Buffer;
+                if (isBinaryFile(newPath)) {
+                    content = Buffer.from(await this.vault.readBinary(file));
+                } else {
+                    content = Buffer.from(await this.vault.read(file), "utf-8");
+                }
+
+                await this.mega.put(remotePath, content);
+                await this.mega.delete(oldRemotePath);
+
+                // Update sync state: remove old, add new
+                this.syncState.removeItem(oldPath);
+                const hash = computeHash(content);
+                this.remoteHashMap[newPath] = hash;
+                delete this.remoteHashMap[oldPath];
+
+                this.syncState.setItem(newPath, {
+                    localMtime: file.stat.mtime,
+                    remoteMtime: Date.now(),
+                    contentHash: hash,
+                    syncedAt: Date.now(),
+                    size: content.length,
+                });
+
+                // Remove from maps so other steps don't reprocess
+                deletedLocally.delete(oldPath);
+                hashToDeleted.delete(newLocal.hash);
+
+                result.renames++;
+            } catch (e: any) {
+                console.warn(`[JSync] Rename handling error ${oldPath} → ${newPath}:`, e);
+                // Fall through to normal upload+delete on next steps
+            }
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────
+    //  STEP 2: DELETE_REMOTE
     // ────────────────────────────────────────────────────────────
 
     /**
@@ -618,7 +732,9 @@ export class SyncEngine {
             if (this.cancelRequested) break;
             if (remoteFiles.has(path)) continue;
             if (!localFiles.has(path)) {
-                // Gone from both sides — clean up sync state
+                // Ghost-file reconciliation: gone from both sides
+                // (e.g. both devices deleted while offline)
+                console.log(`[JSync] Ghost-file cleanup: ${path} (deleted on both sides)`);
                 this.syncState.removeItem(path);
                 delete this.remoteHashMap[path];
                 continue;
@@ -813,8 +929,7 @@ export class SyncEngine {
 
     private isExcluded(path: string): boolean {
         const normalPath = normalizePath(path);
-        if (normalPath.startsWith(".jsync") || normalPath === ".jsync") return true;
-
+        // .obsidian/ is already in excludedFolders by default (contains sync state)
         for (const excluded of this.settings.excludedFolders) {
             const normalExcl = normalizePath(excluded);
             if (normalPath === normalExcl || normalPath.startsWith(normalExcl + "/")) {
