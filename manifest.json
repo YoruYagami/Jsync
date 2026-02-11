@@ -1,0 +1,10 @@
+{
+    "id": "jsync-mega",
+    "name": "JSync",
+    "version": "1.0.0",
+    "minAppVersion": "1.0.0",
+    "description": "Joplin-style bidirectional sync for your Obsidian vault via MEGA cloud storage. Delta sync, conflict resolution, and attachment handling.",
+    "author": "samsepi01",
+    "authorUrl": "",
+    "isDesktopOnly": true
+}
